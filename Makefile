@@ -1,9 +1,9 @@
 CC=gcc
-CFLAGS=-std=c11 -Wall -Wextra -Wpedantic -O2 -g
+CFLAGS=-std=c11 -Wall -Wextra -Wpedantic -O2 -g -D_POSIX_C_SOURCE=200809L
 LDLIBS=-lpthread
 
 COMMON_SRC=common/protocol.c
-SERVER_SRC=server/main.c
+SERVER_SRC=server/main.c server/game.c
 CLIENT_SRC=client/main.c
 
 SERVER_BIN=server_bin

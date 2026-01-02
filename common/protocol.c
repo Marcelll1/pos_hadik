@@ -32,7 +32,7 @@ int recv_all_bytes(int socket_fd, void *buffer, size_t byte_count) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (bytes_recv == 0) return -1; // peer closed
+        if (bytes_recv == 0) return -1;
         bytes_recv_total += (size_t)bytes_recv;
     }
     return 0;
@@ -54,4 +54,5 @@ int send_message(int socket_fd, uint16_t message_type_host, const void *payload,
 int recv_message_header(int socket_fd, message_header_t *out_header_net) {
     return recv_all_bytes(socket_fd, out_header_net, sizeof(*out_header_net));
 }
+
 

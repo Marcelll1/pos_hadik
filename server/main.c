@@ -70,7 +70,7 @@ static void server_init(server_context_t *server_ctx, int listen_fd) {
     pthread_mutex_init(&server_ctx->state_mutex, NULL);
     server_ctx->is_running = 1;
 
-    server_ctx->tick_interval_ms = 200; // 5 Hz zatial
+    server_ctx->tick_interval_ms = 200;
     game_init(&server_ctx->game_state, STATE_MAP_WIDTH, STATE_MAP_HEIGHT);
 }
 
@@ -118,6 +118,27 @@ static int find_slot_by_fd(const server_context_t *server_ctx, int client_fd) {
     return -1;
 }
 
+static void fill_state_player_list(const game_state_t *game_state, state_player_info_t *out_players) {
+    for (int i = 0; i < STATE_MAX_PLAYERS; i++) {
+        state_player_info_t *p = &out_players[i];
+        memset(p, 0, sizeof(*p));
+
+        const game_player_t *gp = &game_state->players[i];
+
+        p->is_used = (uint8_t)(gp->is_active ? 1 : 0);
+        p->has_joined = (uint8_t)(gp->has_joined ? 1 : 0);
+        p->is_alive = (uint8_t)(gp->is_alive ? 1 : 0);
+        p->score_net = htons(gp->score);
+
+        if (gp->player_name[0] != '\0') {
+            strncpy((char*)p->name, gp->player_name, STATE_NAME_MAX - 1);
+            p->name[STATE_NAME_MAX - 1] = '\0';
+        } else {
+            p->name[0] = '\0';
+        }
+    }
+}
+
 static void handle_client_message(server_context_t *server_ctx, int client_fd) {
     message_header_t header_net;
     if (recv_message_header(client_fd, &header_net) < 0) {
@@ -132,6 +153,13 @@ static void handle_client_message(server_context_t *server_ctx, int client_fd) {
     if (slot_index < 0) {
         drain_payload_if_any(client_fd, payload_len);
         shutdown(client_fd, SHUT_RDWR);
+        return;
+    }
+
+    if (message_type == MSG_SHUTDOWN) {
+        drain_payload_if_any(client_fd, payload_len);
+        printf("server: shutdown requested by fd=%d (slot=%d)\n", client_fd, slot_index);
+        server_ctx->is_running = 0;
         return;
     }
 
@@ -207,7 +235,6 @@ static void *server_tick_thread(void *arg) {
         sleep_time.tv_nsec = (long)(server_ctx->tick_interval_ms % 1000) * 1000L * 1000L;
         nanosleep(&sleep_time, NULL);
 
-        // update + build map
         state_message_t state_message;
         memset(&state_message, 0, sizeof(state_message));
         state_message.width = STATE_MAP_WIDTH;
@@ -218,6 +245,7 @@ static void *server_tick_thread(void *arg) {
         game_tick(&server_ctx->game_state);
 
         state_message.tick_counter_net = htonl(server_ctx->game_state.tick_counter);
+        fill_state_player_list(&server_ctx->game_state, state_message.players);
         game_build_ascii_map(&server_ctx->game_state, state_message.cells);
 
         for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -234,7 +262,7 @@ static void *server_tick_thread(void *arg) {
 }
 
 int main(int argc, char **argv) {
-    uint16_t port = 12345;
+    uint16_t port = 23456;
     if (argc >= 2) port = (uint16_t)atoi(argv[1]);
 
     int listen_fd = create_listen_socket(port);
@@ -255,7 +283,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    while (1) {
+    while (server_ctx.is_running) {
         fd_set read_fds;
         FD_ZERO(&read_fds);
 
@@ -338,6 +366,8 @@ int main(int argc, char **argv) {
 
     server_ctx.is_running = 0;
 
+    pthread_join(tick_thread, NULL);
+
     pthread_mutex_lock(&server_ctx.state_mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (server_ctx.client_slots[i].client_socket_fd >= 0) {
@@ -348,6 +378,8 @@ int main(int argc, char **argv) {
 
     close(server_ctx.listen_socket_fd);
     pthread_mutex_destroy(&server_ctx.state_mutex);
+
+    printf("server: stopped\n");
     return 0;
 }
 

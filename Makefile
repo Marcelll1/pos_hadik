@@ -9,7 +9,10 @@ CLIENT_SRC=client/main.c
 SERVER_BIN=server_bin
 CLIENT_BIN=client_bin
 
-all: $(SERVER_BIN) $(CLIENT_BIN)
+all: server client
+
+server: $(SERVER_BIN)
+client: $(CLIENT_BIN)
 
 $(SERVER_BIN): $(COMMON_SRC) $(SERVER_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)

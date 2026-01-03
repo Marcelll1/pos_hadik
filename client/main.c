@@ -37,6 +37,14 @@ static int connect_to_server(const char *server_ip, uint16_t server_port) {
     return socket_fd;
 }
 
+static void sleep_ms(int ms) {
+    if (ms <= 0) return;
+    struct timespec t;
+    t.tv_sec = ms / 1000;
+    t.tv_nsec = (long)(ms % 1000) * 1000L * 1000L;
+    nanosleep(&t, NULL);
+}
+
 static int recv_state_message(int server_socket_fd, state_message_t *out_state) {
     message_header_t header_net;
     if (recv_message_header(server_socket_fd, &header_net) < 0) return -1;
@@ -56,6 +64,7 @@ static int recv_state_message(int server_socket_fd, state_message_t *out_state) 
         if (recv_all_bytes(server_socket_fd, tmp, n) < 0) return -1;
         tmp[n] = '\0';
 
+        // zahod zvysok
         if (payload_len > n) {
             uint16_t rem = (uint16_t)(payload_len - n);
             char dump[256];
@@ -85,19 +94,32 @@ static void render_scoreboard(const state_message_t *state) {
     printf("players:\n");
     for (int i = 0; i < STATE_MAX_PLAYERS; i++) {
         const state_player_info_t *p = &state->players[i];
-        if (!p->is_used || !p->has_joined) continue;
+        if (!p->has_joined) continue;
 
         unsigned score = (unsigned)ntohs(p->score_net);
-        const char *status = p->is_alive ? "alive" : "dead";
-        printf("  %c  name=%s  score=%u  %s\n", player_label_char(i), (const char*)p->name, score, status);
+        const char *alive = p->is_alive ? "alive" : "dead";
+        const char *paused = p->is_paused ? "paused" : "run";
+        printf("  %c name=%s score=%u %s %s\n", player_label_char(i), (const char*)p->name, score, alive, paused);
     }
 }
 
 static void render_state(const state_message_t *state) {
     uint32_t tick = ntohl(state->tick_counter_net);
+    uint32_t elapsed_ms = ntohl(state->elapsed_ms_net);
+    uint32_t remaining_ms = ntohl(state->remaining_ms_net);
+
+    unsigned elapsed_s = elapsed_ms / 1000U;
+    unsigned rem_s = remaining_ms / 1000U;
 
     printf("\033[H\033[J");
-    printf("tick=%u | ovladanie: WASD, q=quit\n", (unsigned)tick);
+    if (state->game_mode == GAME_MODE_TIMED) {
+        printf("tick=%u | time=%us | remaining=%us | WASD move | p pause | q leave\n",
+               (unsigned)tick, elapsed_s, rem_s);
+    } else {
+        printf("tick=%u | time=%us | STANDARD | WASD move | p pause | q leave\n",
+               (unsigned)tick, elapsed_s);
+    }
+
     render_scoreboard(state);
     printf("\n");
 
@@ -163,15 +185,7 @@ static void prompt_string(const char *label, const char *default_value, char *ou
     }
 }
 
-static void sleep_ms(int ms) {
-    if (ms <= 0) return;
-    struct timespec t;
-    t.tv_sec = ms / 1000;
-    t.tv_nsec = (long)(ms % 1000) * 1000L * 1000L;
-    nanosleep(&t, NULL);
-}
-
-static int start_server_process(uint16_t port) {
+static int start_server_process(uint16_t port, game_mode_t mode, uint32_t timed_seconds) {
     pid_t pid = fork();
     if (pid < 0) return -1;
 
@@ -180,9 +194,14 @@ static int start_server_process(uint16_t port) {
         signal(SIGHUP, SIG_IGN);
 
         char port_str[16];
-        snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
+        char mode_str[16];
+        char timed_str[16];
 
-        execl("./server_bin", "server_bin", port_str, (char*)NULL);
+        snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
+        snprintf(mode_str, sizeof(mode_str), "%u", (unsigned)mode);
+        snprintf(timed_str, sizeof(timed_str), "%u", (unsigned)timed_seconds);
+
+        execl("./server_bin", "server_bin", port_str, mode_str, timed_str, (char*)NULL);
 
         perror("exec server_bin failed");
         _exit(127);
@@ -191,7 +210,30 @@ static int start_server_process(uint16_t port) {
     return 0;
 }
 
-static int run_game_session(const char *server_ip, uint16_t server_port, const char *player_name) {
+static int request_server_shutdown(const char *server_ip, uint16_t server_port) {
+    int fd = connect_to_server(server_ip, server_port);
+    if (fd < 0) {
+        fprintf(stderr, "client: connect failed: %s\n", strerror(errno));
+        return -1;
+    }
+    if (send_message(fd, MSG_SHUTDOWN, NULL, 0) < 0) {
+        fprintf(stderr, "client: send shutdown failed\n");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    printf("client: shutdown request sent\n");
+    return 0;
+}
+
+typedef struct {
+    int has_paused_session;
+    char server_ip[64];
+    uint16_t server_port;
+    char player_name[64];
+} paused_session_t;
+
+static int run_game_session(const char *server_ip, uint16_t server_port, const char *player_name, paused_session_t *paused_session) {
     int server_socket_fd = connect_to_server(server_ip, server_port);
     if (server_socket_fd < 0) {
         fprintf(stderr, "client: connect failed: %s\n", strerror(errno));
@@ -208,6 +250,8 @@ static int run_game_session(const char *server_ip, uint16_t server_port, const c
     enable_raw_mode(&old_term);
 
     int is_running = 1;
+    int did_pause = 0;
+
     while (is_running) {
         fd_set read_fds;
         FD_ZERO(&read_fds);
@@ -227,6 +271,13 @@ static int run_game_session(const char *server_ip, uint16_t server_port, const c
             ssize_t n = read(STDIN_FILENO, &ch, 1);
             if (n == 1) {
                 if (ch == 'q' || ch == 'Q') {
+
+                    (void)send_message(server_socket_fd, MSG_LEAVE, NULL, 0);
+                    is_running = 0;
+                } else if (ch == 'p' || ch == 'P') {
+
+                    (void)send_message(server_socket_fd, MSG_PAUSE, NULL, 0);
+                    did_pause = 1;
                     is_running = 0;
                 } else if (ch == 'w' || ch == 'W') {
                     send_input_direction(server_socket_fd, DIR_UP);
@@ -255,39 +306,45 @@ static int run_game_session(const char *server_ip, uint16_t server_port, const c
 
     restore_terminal(&old_term);
     close(server_socket_fd);
-    printf("\nclient: session ended\n");
+
+    if (did_pause) {
+        paused_session->has_paused_session = 1;
+        strncpy(paused_session->server_ip, server_ip, sizeof(paused_session->server_ip) - 1);
+        paused_session->server_ip[sizeof(paused_session->server_ip) - 1] = '\0';
+        paused_session->server_port = server_port;
+        strncpy(paused_session->player_name, player_name, sizeof(paused_session->player_name) - 1);
+        paused_session->player_name[sizeof(paused_session->player_name) - 1] = '\0';
+        printf("\nclient: paused -> back to menu\n");
+    } else {
+        // po leave nema zmysel "continue"
+        paused_session->has_paused_session = 0;
+        printf("\nclient: session ended\n");
+    }
+
     return 0;
 }
 
-static int request_server_shutdown(const char *server_ip, uint16_t server_port) {
-    int fd = connect_to_server(server_ip, server_port);
-    if (fd < 0) {
-        fprintf(stderr, "client: connect failed: %s\n", strerror(errno));
-        return -1;
-    }
-    if (send_message(fd, MSG_SHUTDOWN, NULL, 0) < 0) {
-        fprintf(stderr, "client: send shutdown failed\n");
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    printf("client: shutdown request sent\n");
-    return 0;
-}
-
-static void print_menu(void) {
+static void print_menu(const paused_session_t *paused) {
     printf("\n=== MENU ===\n");
     printf("1) Nova hra (spusti server)\n");
     printf("2) Pripojit sa na existujuci server\n");
-    printf("3) Koniec\n");
-    printf("4) Ukoncit server (posle shutdown)\n");
+    if (paused->has_paused_session) {
+        printf("3) Pokracovat v hre (resume)\n");
+    } else {
+        printf("3) Pokracovat v hre (resume) [nie je dostupne]\n");
+    }
+    printf("4) Koniec\n");
+    printf("5) Ukoncit server (shutdown)\n");
     printf("Vyber: ");
     fflush(stdout);
 }
 
 int main(void) {
+    paused_session_t paused;
+    memset(&paused, 0, sizeof(paused));
+
     while (1) {
-        print_menu();
+        print_menu(&paused);
 
         char choice_line[32];
         read_line(choice_line, sizeof(choice_line));
@@ -307,15 +364,26 @@ int main(void) {
             }
             uint16_t port = (uint16_t)port_i;
 
+            int mode_i = prompt_int("Rezim (0=standard 10s, 1=casovy)", 0);
+            game_mode_t mode = (mode_i == 1) ? GAME_MODE_TIMED : GAME_MODE_STANDARD;
+
+            uint32_t timed_seconds = 60;
+            if (mode == GAME_MODE_TIMED) {
+                int t = prompt_int("Dlzka hry v sekundach", 60);
+                if (t <= 0) t = 60;
+                timed_seconds = (uint32_t)t;
+            }
+
             printf("Spustam server na porte %u...\n", (unsigned)port);
-            if (start_server_process(port) < 0) {
+            if (start_server_process(port, mode, timed_seconds) < 0) {
                 printf("Nepodarilo sa spustit server (fork/exec).\n");
                 continue;
             }
 
             sleep_ms(200);
 
-            (void)run_game_session(server_ip, port, player_name);
+            (void)run_game_session(server_ip, port, player_name, &paused);
+
         } else if (choice == 2) {
             char player_name[64];
             char server_ip[64];
@@ -330,11 +398,20 @@ int main(void) {
             }
             uint16_t port = (uint16_t)port_i;
 
-            (void)run_game_session(server_ip, port, player_name);
+            (void)run_game_session(server_ip, port, player_name, &paused);
+
         } else if (choice == 3) {
+            if (!paused.has_paused_session) {
+                printf("Nie je co pokracovat (nebola pauza).\n");
+                continue;
+            }
+            (void)run_game_session(paused.server_ip, paused.server_port, paused.player_name, &paused);
+
+        } else if (choice == 4) {
             printf("Koniec.\n");
             break;
-        } else if (choice == 4) {
+
+        } else if (choice == 5) {
             char server_ip[64];
             prompt_string("IP servera", "127.0.0.1", server_ip, sizeof(server_ip));
 
@@ -346,6 +423,7 @@ int main(void) {
             uint16_t port = (uint16_t)port_i;
 
             (void)request_server_shutdown(server_ip, port);
+
         } else {
             printf("Zly vyber.\n");
         }
@@ -353,5 +431,4 @@ int main(void) {
 
     return 0;
 }
-
 

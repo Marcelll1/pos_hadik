@@ -31,7 +31,16 @@ typedef struct {
 
     uint32_t tick_interval_ms;
     game_state_t game_state;
+
+    game_mode_t game_mode;
+    uint32_t timed_duration_ms;
 } server_context_t;
+
+static uint64_t monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
 
 static int create_listen_socket(uint16_t port) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -60,7 +69,7 @@ static int create_listen_socket(uint16_t port) {
     return listen_fd;
 }
 
-static void server_init(server_context_t *server_ctx, int listen_fd) {
+static void server_init(server_context_t *server_ctx, int listen_fd, game_mode_t mode, uint32_t timed_duration_ms) {
     server_ctx->listen_socket_fd = listen_fd;
 
     for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -71,7 +80,16 @@ static void server_init(server_context_t *server_ctx, int listen_fd) {
     server_ctx->is_running = 1;
 
     server_ctx->tick_interval_ms = 200;
-    game_init(&server_ctx->game_state, STATE_MAP_WIDTH, STATE_MAP_HEIGHT);
+    server_ctx->game_mode = mode;
+    server_ctx->timed_duration_ms = timed_duration_ms;
+
+    game_init(&server_ctx->game_state, STATE_MAP_WIDTH, STATE_MAP_HEIGHT, mode, timed_duration_ms);
+
+    uint64_t now = monotonic_ms();
+    server_ctx->game_state.start_time_ms = now;
+    if (mode == GAME_MODE_TIMED) {
+        server_ctx->game_state.timed_end_ms = now + (uint64_t)timed_duration_ms;
+    }
 }
 
 static int server_add_client(server_context_t *server_ctx, int client_fd, int *out_slot_index) {
@@ -85,13 +103,12 @@ static int server_add_client(server_context_t *server_ctx, int client_fd, int *o
     return -1;
 }
 
-static void server_remove_client(server_context_t *server_ctx, int slot_index) {
+static void server_close_slot_fd(server_context_t *server_ctx, int slot_index) {
     int client_fd = server_ctx->client_slots[slot_index].client_socket_fd;
     if (client_fd >= 0) {
         close(client_fd);
         server_ctx->client_slots[slot_index].client_socket_fd = -1;
     }
-    game_mark_client_inactive(&server_ctx->game_state, slot_index);
 }
 
 static int socket_is_disconnected(int socket_fd) {
@@ -125,9 +142,10 @@ static void fill_state_player_list(const game_state_t *game_state, state_player_
 
         const game_player_t *gp = &game_state->players[i];
 
-        p->is_used = (uint8_t)(gp->is_active ? 1 : 0);
+        p->is_used = (uint8_t)(gp->has_joined ? 1 : 0);
         p->has_joined = (uint8_t)(gp->has_joined ? 1 : 0);
         p->is_alive = (uint8_t)(gp->is_alive ? 1 : 0);
+        p->is_paused = (uint8_t)(gp->is_paused ? 1 : 0);
         p->score_net = htons(gp->score);
 
         if (gp->player_name[0] != '\0') {
@@ -137,6 +155,13 @@ static void fill_state_player_list(const game_state_t *game_state, state_player_
             p->name[0] = '\0';
         }
     }
+}
+
+static void migrate_client_slot(server_context_t *server_ctx, int from_slot, int to_slot) {
+    if (from_slot == to_slot) return;
+    int fd = server_ctx->client_slots[from_slot].client_socket_fd;
+    server_ctx->client_slots[from_slot].client_socket_fd = -1;
+    server_ctx->client_slots[to_slot].client_socket_fd = fd;
 }
 
 static void handle_client_message(server_context_t *server_ctx, int client_fd) {
@@ -163,6 +188,27 @@ static void handle_client_message(server_context_t *server_ctx, int client_fd) {
         return;
     }
 
+    if (message_type == MSG_PAUSE) {
+        drain_payload_if_any(client_fd, payload_len);
+        pthread_mutex_lock(&server_ctx->state_mutex);
+        game_handle_pause(&server_ctx->game_state, slot_index);
+        server_close_slot_fd(server_ctx, slot_index);
+        game_mark_client_inactive_keep_or_clear(&server_ctx->game_state, slot_index, 1);
+        pthread_mutex_unlock(&server_ctx->state_mutex);
+        printf("server: slot=%d paused\n", slot_index);
+        return;
+    }
+
+    if (message_type == MSG_LEAVE) {
+        drain_payload_if_any(client_fd, payload_len);
+        pthread_mutex_lock(&server_ctx->state_mutex);
+        server_close_slot_fd(server_ctx, slot_index);
+        game_handle_leave(&server_ctx->game_state, slot_index);
+        pthread_mutex_unlock(&server_ctx->state_mutex);
+        printf("server: slot=%d leave\n", slot_index);
+        return;
+    }
+
     if (message_type == MSG_JOIN) {
         char player_name[MAX_JOIN_NAME];
 
@@ -178,8 +224,30 @@ static void handle_client_message(server_context_t *server_ctx, int client_fd) {
         }
         player_name[payload_len] = '\0';
 
+        uint64_t now = monotonic_ms();
+
         pthread_mutex_lock(&server_ctx->state_mutex);
-        int join_rc = game_handle_join(&server_ctx->game_state, slot_index, player_name);
+
+        int paused_slot = game_find_paused_player_by_name(&server_ctx->game_state, player_name);
+        if (paused_slot >= 0 && paused_slot != slot_index) {
+            migrate_client_slot(server_ctx, slot_index, paused_slot);
+
+            game_mark_client_inactive_keep_or_clear(&server_ctx->game_state, slot_index, 0);
+
+            slot_index = paused_slot;
+            game_mark_client_active(&server_ctx->game_state, slot_index);
+            (void)game_resume_player(&server_ctx->game_state, slot_index, now);
+
+            pthread_mutex_unlock(&server_ctx->state_mutex);
+
+            printf("server: RESUME slot=%d fd=%d name='%s'\n", slot_index, client_fd, player_name);
+            const char *welcome_text = "RESUMED (3s freeze) | WASD move | p pause | q leave";
+            send_message(client_fd, MSG_WELCOME, welcome_text, (uint16_t)strlen(welcome_text));
+            return;
+        }
+
+        int join_rc = game_join_new_player(&server_ctx->game_state, slot_index, player_name, now);
+
         pthread_mutex_unlock(&server_ctx->state_mutex);
 
         if (join_rc < 0) {
@@ -189,9 +257,9 @@ static void handle_client_message(server_context_t *server_ctx, int client_fd) {
             return;
         }
 
-        printf("server: slot=%d fd=%d JOIN name='%s'\n", slot_index, client_fd, player_name);
+        printf("server: JOIN slot=%d fd=%d name='%s'\n", slot_index, client_fd, player_name);
 
-        const char *welcome_text = "WELCOME (WASD to move, q to quit)";
+        const char *welcome_text = "WELCOME | WASD move | p pause | q leave";
         send_message(client_fd, MSG_WELCOME, welcome_text, (uint16_t)strlen(welcome_text));
         return;
     }
@@ -235,23 +303,33 @@ static void *server_tick_thread(void *arg) {
         sleep_time.tv_nsec = (long)(server_ctx->tick_interval_ms % 1000) * 1000L * 1000L;
         nanosleep(&sleep_time, NULL);
 
+        uint64_t now = monotonic_ms();
+
         state_message_t state_message;
         memset(&state_message, 0, sizeof(state_message));
         state_message.width = STATE_MAP_WIDTH;
         state_message.height = STATE_MAP_HEIGHT;
+        state_message.game_mode = (uint8_t)server_ctx->game_mode;
 
         pthread_mutex_lock(&server_ctx->state_mutex);
 
-        game_tick(&server_ctx->game_state);
+        game_tick(&server_ctx->game_state, now);
+
+        if (server_ctx->game_state.should_terminate) {
+            server_ctx->is_running = 0;
+        }
 
         state_message.tick_counter_net = htonl(server_ctx->game_state.tick_counter);
+        state_message.elapsed_ms_net = htonl(game_get_elapsed_ms(&server_ctx->game_state, now));
+        state_message.remaining_ms_net = htonl(game_get_remaining_ms(&server_ctx->game_state, now));
+
         fill_state_player_list(&server_ctx->game_state, state_message.players);
         game_build_ascii_map(&server_ctx->game_state, state_message.cells);
 
         for (int i = 0; i < MAX_CLIENTS; i++) {
-            int client_fd = server_ctx->client_slots[i].client_socket_fd;
-            if (client_fd >= 0) {
-                send_message(client_fd, MSG_STATE, &state_message, (uint16_t)sizeof(state_message));
+            int fd = server_ctx->client_slots[i].client_socket_fd;
+            if (fd >= 0) {
+                send_message(fd, MSG_STATE, &state_message, (uint16_t)sizeof(state_message));
             }
         }
 
@@ -263,7 +341,14 @@ static void *server_tick_thread(void *arg) {
 
 int main(int argc, char **argv) {
     uint16_t port = 23456;
+    game_mode_t mode = GAME_MODE_STANDARD;
+    uint32_t timed_seconds = 60;
+
     if (argc >= 2) port = (uint16_t)atoi(argv[1]);
+    if (argc >= 3) mode = (game_mode_t)atoi(argv[2]);
+    if (argc >= 4) timed_seconds = (uint32_t)atoi(argv[3]);
+
+    uint32_t timed_ms = timed_seconds * 1000U;
 
     int listen_fd = create_listen_socket(port);
     if (listen_fd < 0) {
@@ -272,9 +357,9 @@ int main(int argc, char **argv) {
     }
 
     server_context_t server_ctx;
-    server_init(&server_ctx, listen_fd);
+    server_init(&server_ctx, listen_fd, mode, timed_ms);
 
-    printf("server: listening on port %u\n", port);
+    printf("server: listening on port %u | mode=%d | timed=%us\n", port, (int)mode, (unsigned)timed_seconds);
 
     pthread_t tick_thread;
     if (pthread_create(&tick_thread, NULL, server_tick_thread, &server_ctx) != 0) {
@@ -300,10 +385,10 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&server_ctx.state_mutex);
 
         for (int i = 0; i < MAX_CLIENTS; i++) {
-            int client_fd = client_fds_snapshot[i];
-            if (client_fd >= 0) {
-                FD_SET(client_fd, &read_fds);
-                if (client_fd > max_fd) max_fd = client_fd;
+            int fd = client_fds_snapshot[i];
+            if (fd >= 0) {
+                FD_SET(fd, &read_fds);
+                if (fd > max_fd) max_fd = fd;
             }
         }
 
@@ -345,17 +430,21 @@ int main(int argc, char **argv) {
         }
 
         for (int i = 0; i < MAX_CLIENTS; i++) {
-            int client_fd = client_fds_snapshot[i];
-            if (client_fd >= 0 && FD_ISSET(client_fd, &read_fds)) {
-                handle_client_message(&server_ctx, client_fd);
+            int fd = client_fds_snapshot[i];
+            if (fd >= 0 && FD_ISSET(fd, &read_fds)) {
+                handle_client_message(&server_ctx, fd);
 
-                if (socket_is_disconnected(client_fd)) {
+                if (socket_is_disconnected(fd)) {
                     pthread_mutex_lock(&server_ctx.state_mutex);
 
-                    int slot_index = find_slot_by_fd(&server_ctx, client_fd);
+                    int slot_index = find_slot_by_fd(&server_ctx, fd);
                     if (slot_index >= 0) {
-                        printf("server: slot=%d fd=%d disconnected\n", slot_index, client_fd);
-                        server_remove_client(&server_ctx, slot_index);
+                        int keep = server_ctx.game_state.players[slot_index].is_paused ? 1 : 0;
+                        printf("server: slot=%d fd=%d disconnected (keep=%d)\n", slot_index, fd, keep);
+                        server_close_slot_fd(&server_ctx, slot_index);
+                        game_mark_client_inactive_keep_or_clear(&server_ctx.game_state, slot_index, keep);
+                        if (!keep) {
+                        }
                     }
 
                     pthread_mutex_unlock(&server_ctx.state_mutex);
@@ -365,14 +454,11 @@ int main(int argc, char **argv) {
     }
 
     server_ctx.is_running = 0;
-
     pthread_join(tick_thread, NULL);
 
     pthread_mutex_lock(&server_ctx.state_mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (server_ctx.client_slots[i].client_socket_fd >= 0) {
-            server_remove_client(&server_ctx, i);
-        }
+        server_close_slot_fd(&server_ctx, i);
     }
     pthread_mutex_unlock(&server_ctx.state_mutex);
 

@@ -17,7 +17,10 @@ enum {
 
     MSG_INPUT    = 10,
     MSG_STATE    = 11,
-    MSG_SHUTDOWN = 12
+    MSG_SHUTDOWN = 12,
+
+    MSG_PAUSE    = 13, // hrac pauza + navrat do menu
+    MSG_LEAVE    = 14  // hrac odchadza (had zmizne)
 };
 
 typedef enum {
@@ -38,11 +41,16 @@ typedef struct {
 #define STATE_MAX_PLAYERS 64
 #define STATE_NAME_MAX    32
 
+typedef enum {
+    GAME_MODE_STANDARD = 0,
+    GAME_MODE_TIMED    = 1
+} game_mode_t;
+
 typedef struct {
     uint8_t is_used;
     uint8_t has_joined;
     uint8_t is_alive;
-    uint8_t reserved0;
+    uint8_t is_paused;
 
     uint16_t score_net;
     uint8_t name[STATE_NAME_MAX];
@@ -53,7 +61,11 @@ typedef struct {
 
     uint8_t width;
     uint8_t height;
-    uint16_t reserved1;
+    uint8_t game_mode;      
+    uint8_t reserved0;
+
+    uint32_t elapsed_ms_net;    // od startu hry
+    uint32_t remaining_ms_net;  // len pre timed, inak 0
 
     state_player_info_t players[STATE_MAX_PLAYERS];
 

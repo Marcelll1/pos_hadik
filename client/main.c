@@ -64,7 +64,6 @@ static int recv_state_message(int server_socket_fd, state_message_t *out_state) 
         if (recv_all_bytes(server_socket_fd, tmp, n) < 0) return -1;
         tmp[n] = '\0';
 
-        // zahod zvysok
         if (payload_len > n) {
             uint16_t rem = (uint16_t)(payload_len - n);
             char dump[256];
@@ -185,7 +184,7 @@ static void prompt_string(const char *label, const char *default_value, char *ou
     }
 }
 
-static int start_server_process(uint16_t port, game_mode_t mode, uint32_t timed_seconds) {
+static int start_server_process(uint16_t port, game_mode_t mode, uint32_t timed_seconds, int world_type, const char *map_file_path) {
     pid_t pid = fork();
     if (pid < 0) return -1;
 
@@ -196,12 +195,18 @@ static int start_server_process(uint16_t port, game_mode_t mode, uint32_t timed_
         char port_str[16];
         char mode_str[16];
         char timed_str[16];
+        char world_str[16];
 
         snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
         snprintf(mode_str, sizeof(mode_str), "%u", (unsigned)mode);
         snprintf(timed_str, sizeof(timed_str), "%u", (unsigned)timed_seconds);
+        snprintf(world_str, sizeof(world_str), "%u", (unsigned)world_type);
 
-        execl("./server_bin", "server_bin", port_str, mode_str, timed_str, (char*)NULL);
+        if (world_type == 1 && map_file_path && map_file_path[0] != '\0') {
+            execl("./server_bin", "server_bin", port_str, mode_str, timed_str, world_str, map_file_path, (char*)NULL);
+        } else {
+            execl("./server_bin", "server_bin", port_str, mode_str, timed_str, world_str, (char*)NULL);
+        }
 
         perror("exec server_bin failed");
         _exit(127);
@@ -271,11 +276,9 @@ static int run_game_session(const char *server_ip, uint16_t server_port, const c
             ssize_t n = read(STDIN_FILENO, &ch, 1);
             if (n == 1) {
                 if (ch == 'q' || ch == 'Q') {
-
                     (void)send_message(server_socket_fd, MSG_LEAVE, NULL, 0);
                     is_running = 0;
                 } else if (ch == 'p' || ch == 'P') {
-
                     (void)send_message(server_socket_fd, MSG_PAUSE, NULL, 0);
                     did_pause = 1;
                     is_running = 0;
@@ -316,7 +319,6 @@ static int run_game_session(const char *server_ip, uint16_t server_port, const c
         paused_session->player_name[sizeof(paused_session->player_name) - 1] = '\0';
         printf("\nclient: paused -> back to menu\n");
     } else {
-        // po leave nema zmysel "continue"
         paused_session->has_paused_session = 0;
         printf("\nclient: session ended\n");
     }
@@ -374,8 +376,19 @@ int main(void) {
                 timed_seconds = (uint32_t)t;
             }
 
+            int world_i = prompt_int("Svet (0=empty wrap, 1=prekazky zo suboru)", 0);
+            int world_type = (world_i == 1) ? 1 : 0;
+
+            char map_path[256];
+            map_path[0] = '\0';
+            const char *map_file_path = NULL;
+            if (world_type == 1) {
+                prompt_string("Cesta k mape", "maps/world1.map", map_path, sizeof(map_path));
+                map_file_path = map_path;
+            }
+
             printf("Spustam server na porte %u...\n", (unsigned)port);
-            if (start_server_process(port, mode, timed_seconds) < 0) {
+            if (start_server_process(port, mode, timed_seconds, world_type, map_file_path) < 0) {
                 printf("Nepodarilo sa spustit server (fork/exec).\n");
                 continue;
             }
@@ -408,7 +421,6 @@ int main(void) {
             (void)run_game_session(paused.server_ip, paused.server_port, paused.player_name, &paused);
 
         } else if (choice == 4) {
-            printf("Koniec.\n");
             break;
 
         } else if (choice == 5) {

@@ -19,8 +19,8 @@ enum {
     MSG_STATE    = 11,
     MSG_SHUTDOWN = 12,
 
-    MSG_PAUSE    = 13, // hrac pauza + navrat do menu
-    MSG_LEAVE    = 14  // hrac odchadza (had zmizne)
+    MSG_PAUSE    = 13,
+    MSG_LEAVE    = 14
 };
 
 typedef enum {
@@ -61,14 +61,13 @@ typedef struct {
 
     uint8_t width;
     uint8_t height;
-    uint8_t game_mode;      
+    uint8_t game_mode;
     uint8_t reserved0;
 
-    uint32_t elapsed_ms_net;    // od startu hry
-    uint32_t remaining_ms_net;  // len pre timed, inak 0
+    uint32_t elapsed_ms_net;
+    uint32_t remaining_ms_net;
 
     state_player_info_t players[STATE_MAX_PLAYERS];
-
     uint8_t cells[STATE_MAP_CELLS];
 } __attribute__((packed)) state_message_t;
 
@@ -77,6 +76,18 @@ int recv_all_bytes(int socket_fd, void *buffer, size_t byte_count);
 
 int send_message(int socket_fd, uint16_t message_type_host, const void *payload, uint16_t payload_len_host);
 int recv_message_header(int socket_fd, message_header_t *out_header_net);
+
+static inline int send_msg(int socket_fd, uint16_t message_type_host, const void *payload, uint16_t payload_len_host) {
+    return send_message(socket_fd, message_type_host, payload, payload_len_host);
+}
+
+static inline int recv_hdr(int socket_fd, message_header_t *out_header_net) {
+    return recv_message_header(socket_fd, out_header_net);
+}
+
+static inline int recv_all(int socket_fd, void *buffer, size_t byte_count) {
+    return recv_all_bytes(socket_fd, buffer, byte_count);
+}
 
 #endif
 

@@ -34,6 +34,9 @@ typedef struct {
 
     game_mode_t game_mode;
     uint32_t timed_duration_ms;
+
+    world_type_t world_type;
+    char map_file_path[256];
 } server_context_t;
 
 static uint64_t monotonic_ms(void) {
@@ -69,7 +72,7 @@ static int create_listen_socket(uint16_t port) {
     return listen_fd;
 }
 
-static void server_init(server_context_t *server_ctx, int listen_fd, game_mode_t mode, uint32_t timed_duration_ms) {
+static void server_init(server_context_t *server_ctx, int listen_fd, game_mode_t mode, uint32_t timed_duration_ms, world_type_t world_type, const char *map_file_path) {
     server_ctx->listen_socket_fd = listen_fd;
 
     for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -83,7 +86,14 @@ static void server_init(server_context_t *server_ctx, int listen_fd, game_mode_t
     server_ctx->game_mode = mode;
     server_ctx->timed_duration_ms = timed_duration_ms;
 
-    game_init(&server_ctx->game_state, STATE_MAP_WIDTH, STATE_MAP_HEIGHT, mode, timed_duration_ms);
+    server_ctx->world_type = world_type;
+    server_ctx->map_file_path[0] = '\0';
+    if (map_file_path && map_file_path[0] != '\0') {
+        strncpy(server_ctx->map_file_path, map_file_path, sizeof(server_ctx->map_file_path) - 1);
+        server_ctx->map_file_path[sizeof(server_ctx->map_file_path) - 1] = '\0';
+    }
+
+    game_init(&server_ctx->game_state, STATE_MAP_WIDTH, STATE_MAP_HEIGHT, mode, timed_duration_ms, world_type);
 
     uint64_t now = monotonic_ms();
     server_ctx->game_state.start_time_ms = now;
@@ -183,7 +193,6 @@ static void handle_client_message(server_context_t *server_ctx, int client_fd) {
 
     if (message_type == MSG_SHUTDOWN) {
         drain_payload_if_any(client_fd, payload_len);
-        printf("server: shutdown requested by fd=%d (slot=%d)\n", client_fd, slot_index);
         server_ctx->is_running = 0;
         return;
     }
@@ -195,7 +204,6 @@ static void handle_client_message(server_context_t *server_ctx, int client_fd) {
         server_close_slot_fd(server_ctx, slot_index);
         game_mark_client_inactive_keep_or_clear(&server_ctx->game_state, slot_index, 1);
         pthread_mutex_unlock(&server_ctx->state_mutex);
-        printf("server: slot=%d paused\n", slot_index);
         return;
     }
 
@@ -205,7 +213,6 @@ static void handle_client_message(server_context_t *server_ctx, int client_fd) {
         server_close_slot_fd(server_ctx, slot_index);
         game_handle_leave(&server_ctx->game_state, slot_index);
         pthread_mutex_unlock(&server_ctx->state_mutex);
-        printf("server: slot=%d leave\n", slot_index);
         return;
     }
 
@@ -231,7 +238,6 @@ static void handle_client_message(server_context_t *server_ctx, int client_fd) {
         int paused_slot = game_find_paused_player_by_name(&server_ctx->game_state, player_name);
         if (paused_slot >= 0 && paused_slot != slot_index) {
             migrate_client_slot(server_ctx, slot_index, paused_slot);
-
             game_mark_client_inactive_keep_or_clear(&server_ctx->game_state, slot_index, 0);
 
             slot_index = paused_slot;
@@ -240,7 +246,6 @@ static void handle_client_message(server_context_t *server_ctx, int client_fd) {
 
             pthread_mutex_unlock(&server_ctx->state_mutex);
 
-            printf("server: RESUME slot=%d fd=%d name='%s'\n", slot_index, client_fd, player_name);
             const char *welcome_text = "RESUMED (3s freeze) | WASD move | p pause | q leave";
             send_message(client_fd, MSG_WELCOME, welcome_text, (uint16_t)strlen(welcome_text));
             return;
@@ -256,8 +261,6 @@ static void handle_client_message(server_context_t *server_ctx, int client_fd) {
             shutdown(client_fd, SHUT_RDWR);
             return;
         }
-
-        printf("server: JOIN slot=%d fd=%d name='%s'\n", slot_index, client_fd, player_name);
 
         const char *welcome_text = "WELCOME | WASD move | p pause | q leave";
         send_message(client_fd, MSG_WELCOME, welcome_text, (uint16_t)strlen(welcome_text));
@@ -343,10 +346,14 @@ int main(int argc, char **argv) {
     uint16_t port = 23456;
     game_mode_t mode = GAME_MODE_STANDARD;
     uint32_t timed_seconds = 60;
+    world_type_t world_type = WORLD_EMPTY;
+    const char *map_file_path = NULL;
 
     if (argc >= 2) port = (uint16_t)atoi(argv[1]);
     if (argc >= 3) mode = (game_mode_t)atoi(argv[2]);
     if (argc >= 4) timed_seconds = (uint32_t)atoi(argv[3]);
+    if (argc >= 5) world_type = (world_type_t)atoi(argv[4]);
+    if (argc >= 6) map_file_path = argv[5];
 
     uint32_t timed_ms = timed_seconds * 1000U;
 
@@ -357,9 +364,20 @@ int main(int argc, char **argv) {
     }
 
     server_context_t server_ctx;
-    server_init(&server_ctx, listen_fd, mode, timed_ms);
-
-    printf("server: listening on port %u | mode=%d | timed=%us\n", port, (int)mode, (unsigned)timed_seconds);
+    server_init(&server_ctx, listen_fd, mode, timed_ms, world_type, map_file_path);
+    if (world_type == WORLD_FILE) {
+        const char *path = server_ctx.map_file_path[0] ? server_ctx.map_file_path : map_file_path;
+        if (!path || path[0] == '\0') {
+            fprintf(stderr, "server: WORLD_FILE requires map path\n");
+            close(server_ctx.listen_socket_fd);
+            return 1;
+        }
+        if (game_load_map_from_file(&server_ctx.game_state, path) != 0) {
+            fprintf(stderr, "server: failed to load map: %s\n", path);
+            close(server_ctx.listen_socket_fd);
+            return 1;
+        }
+    }
 
     pthread_t tick_thread;
     if (pthread_create(&tick_thread, NULL, server_tick_thread, &server_ctx) != 0) {
@@ -406,11 +424,6 @@ int main(int argc, char **argv) {
             int client_fd = accept(server_ctx.listen_socket_fd,
                                    (struct sockaddr*)&client_addr, &client_addr_len);
             if (client_fd >= 0) {
-                char client_ip[64];
-                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-                printf("server: new tcp client fd=%d from %s:%u\n",
-                       client_fd, client_ip, ntohs(client_addr.sin_port));
-
                 pthread_mutex_lock(&server_ctx.state_mutex);
 
                 int slot_index = -1;
@@ -440,11 +453,8 @@ int main(int argc, char **argv) {
                     int slot_index = find_slot_by_fd(&server_ctx, fd);
                     if (slot_index >= 0) {
                         int keep = server_ctx.game_state.players[slot_index].is_paused ? 1 : 0;
-                        printf("server: slot=%d fd=%d disconnected (keep=%d)\n", slot_index, fd, keep);
                         server_close_slot_fd(&server_ctx, slot_index);
                         game_mark_client_inactive_keep_or_clear(&server_ctx.game_state, slot_index, keep);
-                        if (!keep) {
-                        }
                     }
 
                     pthread_mutex_unlock(&server_ctx.state_mutex);
@@ -465,7 +475,6 @@ int main(int argc, char **argv) {
     close(server_ctx.listen_socket_fd);
     pthread_mutex_destroy(&server_ctx.state_mutex);
 
-    printf("server: stopped\n");
     return 0;
 }
 

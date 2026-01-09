@@ -431,6 +431,43 @@ static void *server_tick_thread(void *arg) {
     return NULL;
 }
 
+static int load_map_and_set_size(game_state_t *game_state, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    char line[1024];
+    int width = -1;
+    int height = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[len - 1] = '\0';
+            len--;
+        }
+        if (len == 0) continue;
+
+        if (width < 0) width = (int)len;
+        if ((int)len != width) {
+            fclose(f);
+            return -1;
+        }
+        height++;
+    }
+
+    fclose(f);
+
+    if (width < 5 || height < 5) return -1;
+    if (width > STATE_MAX_WIDTH || height > STATE_MAX_HEIGHT) return -1;
+
+    game_state->map_width = (uint8_t)width;
+    game_state->map_height = (uint8_t)height;
+
+    memset(game_state->obstacle_map, 0, sizeof(game_state->obstacle_map));
+
+    return game_load_map_from_file(game_state, path);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
@@ -438,6 +475,7 @@ int main(int argc, char **argv) {
     game_mode_t mode = GAME_MODE_STANDARD;
     uint32_t timed_seconds = 60;
     world_type_t world_type = WORLD_EMPTY;
+
     uint8_t map_width = 40;
     uint8_t map_height = 20;
     const char *map_file_path = NULL;
@@ -446,9 +484,14 @@ int main(int argc, char **argv) {
     if (argc >= 3) mode = (game_mode_t)atoi(argv[2]);
     if (argc >= 4) timed_seconds = (uint32_t)atoi(argv[3]);
     if (argc >= 5) world_type = (world_type_t)atoi(argv[4]);
-    if (argc >= 6) map_width = (uint8_t)atoi(argv[5]);
-    if (argc >= 7) map_height = (uint8_t)atoi(argv[6]);
-    if (argc >= 8) map_file_path = argv[7];
+
+    if (world_type == WORLD_FILE) {
+        if (argc >= 6) map_file_path = argv[5];
+    } else {
+        if (argc >= 6) map_width = (uint8_t)atoi(argv[5]);
+        if (argc >= 7) map_height = (uint8_t)atoi(argv[6]);
+        if (argc >= 8) map_file_path = argv[7];
+    }
 
     if (map_width < 5) map_width = 5;
     if (map_height < 5) map_height = 5;
@@ -467,17 +510,18 @@ int main(int argc, char **argv) {
     server_init(&server_ctx, listen_fd, map_width, map_height, mode, timed_ms, world_type, map_file_path);
 
     if (world_type == WORLD_FILE) {
-        const char *path = server_ctx.map_file_path[0] ? server_ctx.map_file_path : map_file_path;
-        if (!path || path[0] == '\0') {
+        if (!map_file_path || map_file_path[0] == '\0') {
             fprintf(stderr, "server: WORLD_FILE requires map path\n");
             close(server_ctx.listen_socket_fd);
             return 1;
         }
-        if (game_load_map_from_file(&server_ctx.game_state, path) != 0) {
-            fprintf(stderr, "server: failed to load map: %s\n", path);
+        if (load_map_and_set_size(&server_ctx.game_state, map_file_path) != 0) {
+            fprintf(stderr, "server: failed to load map: %s\n", map_file_path);
             close(server_ctx.listen_socket_fd);
             return 1;
         }
+        server_ctx.world_type = WORLD_FILE;
+        server_ctx.game_state.world_type = WORLD_FILE;
     }
 
     pthread_t tick_thread;
@@ -575,4 +619,5 @@ int main(int argc, char **argv) {
     close(server_ctx.listen_socket_fd);
     return 0;
 }
+
 

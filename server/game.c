@@ -127,6 +127,19 @@ static void ensure_food_count(game_state_t *g) {
     }
 }
 
+static void strip_line_endings(char *line) {
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+        line[len - 1] = '\0';
+        len--;
+    }
+}
+
+static int map_char_is_obstacle(char c) {
+    if (c == ' ' || c == '.') return 0;
+    return 1;
+}
+
 int game_load_map_from_file(game_state_t *g, const char *path) {
     if (!g || !path || path[0] == '\0') return -1;
     if (g->map_width == 0 || g->map_height == 0) return -1;
@@ -137,24 +150,24 @@ int game_load_map_from_file(game_state_t *g, const char *path) {
 
     memset(g->obstacle_map, 0, sizeof(g->obstacle_map));
 
-    char line[512];
+    char line[1024];
     for (uint8_t y = 0; y < g->map_height; y++) {
         if (!fgets(line, sizeof(line), f)) {
             fclose(f);
             return -1;
         }
+
+        strip_line_endings(line);
+
         size_t len = strlen(line);
-        if (len > 0 && line[len - 1] == '\n') {
-            line[len - 1] = '\0';
-            len--;
-        }
         if (len < g->map_width) {
             fclose(f);
             return -1;
         }
+
         for (uint8_t x = 0; x < g->map_width; x++) {
             char c = line[x];
-            g->obstacle_map[(size_t)y * g->map_width + x] = (c == '#') ? 1 : 0;
+            g->obstacle_map[(size_t)y * g->map_width + x] = map_char_is_obstacle(c) ? 1 : 0;
         }
     }
 

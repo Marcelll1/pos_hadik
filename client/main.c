@@ -227,7 +227,7 @@ static void prompt_string(const char *label, const char *default_value, char *ou
     }
 }
 
-static int start_server_process(uint16_t port, game_mode_t mode, uint32_t timed_seconds, int world_type, uint8_t map_width, uint8_t map_height, const char *map_file_path) {
+static int start_server_process_empty(uint16_t port, game_mode_t mode, uint32_t timed_seconds, int world_type, uint8_t map_width, uint8_t map_height) {
     pid_t pid = fork();
     if (pid < 0) return -1;
 
@@ -249,12 +249,33 @@ static int start_server_process(uint16_t port, game_mode_t mode, uint32_t timed_
         snprintf(width_str, sizeof(width_str), "%u", (unsigned)map_width);
         snprintf(height_str, sizeof(height_str), "%u", (unsigned)map_height);
 
-        if (world_type == 1 && map_file_path && map_file_path[0] != '\0') {
-            execl("./server_bin", "server_bin", port_str, mode_str, timed_str, world_str, width_str, height_str, map_file_path, (char*)NULL);
-        } else {
-            execl("./server_bin", "server_bin", port_str, mode_str, timed_str, world_str, width_str, height_str, (char*)NULL);
-        }
+        execl("./server_bin", "server_bin", port_str, mode_str, timed_str, world_str, width_str, height_str, (char*)NULL);
+        perror("exec server_bin failed");
+        _exit(127);
+    }
 
+    return 0;
+}
+
+static int start_server_process_file(uint16_t port, game_mode_t mode, uint32_t timed_seconds, const char *map_file_path) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+
+    if (pid == 0) {
+        (void)setsid();
+        signal(SIGHUP, SIG_IGN);
+
+        char port_str[16];
+        char mode_str[16];
+        char timed_str[16];
+        char world_str[16];
+
+        snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
+        snprintf(mode_str, sizeof(mode_str), "%u", (unsigned)mode);
+        snprintf(timed_str, sizeof(timed_str), "%u", (unsigned)timed_seconds);
+        snprintf(world_str, sizeof(world_str), "%u", (unsigned)1);
+
+        execl("./server_bin", "server_bin", port_str, mode_str, timed_str, world_str, map_file_path, (char*)NULL);
         perror("exec server_bin failed");
         _exit(127);
     }
@@ -456,33 +477,40 @@ int main(void) {
             int world_i = prompt_int("Svet (0=empty wrap, 1=prekazky zo suboru)", 0);
             int world_type = (world_i == 1) ? 1 : 0;
 
-            int width_i = prompt_int("Sirka mapy (5-80)", 40);
-            int height_i = prompt_int("Vyska mapy (5-40)", 20);
-
-            if (width_i < 5) width_i = 5;
-            if (height_i < 5) height_i = 5;
-            if (width_i > STATE_MAX_WIDTH) width_i = STATE_MAX_WIDTH;
-            if (height_i > STATE_MAX_HEIGHT) height_i = STATE_MAX_HEIGHT;
-
-            uint8_t map_width = (uint8_t)width_i;
-            uint8_t map_height = (uint8_t)height_i;
-
-            char map_path[256];
-            map_path[0] = '\0';
-            const char *map_file_path = NULL;
             if (world_type == 1) {
+                char map_path[256];
                 prompt_string("Cesta k mape", "maps/world1.map", map_path, sizeof(map_path));
-                map_file_path = map_path;
-            }
 
-            printf("Spustam server na porte %u...\n", (unsigned)port);
-            if (start_server_process(port, mode, timed_seconds, world_type, map_width, map_height, map_file_path) < 0) {
-                printf("Nepodarilo sa spustit server (fork/exec).\n");
-                continue;
-            }
+                printf("Spustam server (MAP FILE) na porte %u...\n", (unsigned)port);
+                if (start_server_process_file(port, mode, timed_seconds, map_path) < 0) {
+                    printf("Nepodarilo sa spustit server (fork/exec).\n");
+                    continue;
+                }
 
-            sleep_ms(200);
-            (void)run_game_session(server_ip, port, player_name, &paused);
+                sleep_ms(200);
+                (void)run_game_session(server_ip, port, player_name, &paused);
+
+            } else {
+                int width_i = prompt_int("Sirka mapy (5-80)", 40);
+                int height_i = prompt_int("Vyska mapy (5-40)", 20);
+
+                if (width_i < 5) width_i = 5;
+                if (height_i < 5) height_i = 5;
+                if (width_i > STATE_MAX_WIDTH) width_i = STATE_MAX_WIDTH;
+                if (height_i > STATE_MAX_HEIGHT) height_i = STATE_MAX_HEIGHT;
+
+                uint8_t map_width = (uint8_t)width_i;
+                uint8_t map_height = (uint8_t)height_i;
+
+                printf("Spustam server (EMPTY) na porte %u...\n", (unsigned)port);
+                if (start_server_process_empty(port, mode, timed_seconds, world_type, map_width, map_height) < 0) {
+                    printf("Nepodarilo sa spustit server (fork/exec).\n");
+                    continue;
+                }
+
+                sleep_ms(200);
+                (void)run_game_session(server_ip, port, player_name, &paused);
+            }
 
         } else if (choice == 2) {
             char player_name[64];

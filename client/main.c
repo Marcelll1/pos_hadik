@@ -45,41 +45,46 @@ static void sleep_ms(int ms) {
     nanosleep(&t, NULL);
 }
 
-static int recv_state_message(int server_socket_fd, state_message_t *out_state) {
+static int recv_next_message(int server_socket_fd, uint16_t *out_type, void *payload_buf, size_t payload_buf_cap, uint16_t *out_payload_len) {
     message_header_t header_net;
     if (recv_message_header(server_socket_fd, &header_net) < 0) return -1;
 
     uint16_t message_type = ntohs(header_net.message_type_net);
     uint16_t payload_len  = ntohs(header_net.payload_len_net);
 
-    if (message_type == MSG_STATE) {
-        if (payload_len != sizeof(state_message_t)) return -1;
-        if (recv_all_bytes(server_socket_fd, out_state, sizeof(state_message_t)) < 0) return -1;
-        return 1;
-    }
-
-    if (payload_len > 0) {
-        char tmp[512];
-        uint16_t n = payload_len > (uint16_t)(sizeof(tmp) - 1) ? (uint16_t)(sizeof(tmp) - 1) : payload_len;
-        if (recv_all_bytes(server_socket_fd, tmp, n) < 0) return -1;
-        tmp[n] = '\0';
-
-        if (payload_len > n) {
-            uint16_t rem = (uint16_t)(payload_len - n);
-            char dump[256];
-            while (rem > 0) {
-                uint16_t c = rem > (uint16_t)sizeof(dump) ? (uint16_t)sizeof(dump) : rem;
-                if (recv_all_bytes(server_socket_fd, dump, c) < 0) return -1;
-                rem = (uint16_t)(rem - c);
-            }
+    if (payload_len > payload_buf_cap) {
+        size_t to_read = payload_buf_cap;
+        if (to_read > 0) {
+            if (recv_all_bytes(server_socket_fd, payload_buf, to_read) < 0) return -1;
         }
-
-        printf("client: server msg type=%u: %s\n", (unsigned)message_type, tmp);
-        fflush(stdout);
+        uint16_t rem = (uint16_t)(payload_len - to_read);
+        char dump[256];
+        while (rem > 0) {
+            uint16_t c = rem > (uint16_t)sizeof(dump) ? (uint16_t)sizeof(dump) : rem;
+            if (recv_all_bytes(server_socket_fd, dump, c) < 0) return -1;
+            rem = (uint16_t)(rem - c);
+        }
+        *out_type = message_type;
+        *out_payload_len = (uint16_t)to_read;
         return 0;
     }
 
+    if (payload_len > 0) {
+        if (recv_all_bytes(server_socket_fd, payload_buf, payload_len) < 0) return -1;
+    }
+
+    *out_type = message_type;
+    *out_payload_len = payload_len;
     return 0;
+}
+
+static void trim_player_name_inplace(char *name) {
+    size_t n = strlen(name);
+    while (n > 0 && (name[n - 1] == ' ' || name[n - 1] == '\t' || name[n - 1] == '\r' || name[n - 1] == '\n')) {
+        name[n - 1] = '\0';
+        n--;
+    }
+    if (n >= STATE_NAME_MAX) name[STATE_NAME_MAX - 1] = '\0';
 }
 
 static char player_label_char(int idx) {
@@ -102,6 +107,13 @@ static void render_scoreboard(const state_message_t *state) {
     }
 }
 
+static void print_horizontal_border(uint8_t width) {
+    putchar('+');
+    for (uint8_t i = 0; i < width; i++) putchar('-');
+    putchar('+');
+    putchar('\n');
+}
+
 static void render_state(const state_message_t *state) {
     uint32_t tick = ntohl(state->tick_counter_net);
     uint32_t elapsed_ms = ntohl(state->elapsed_ms_net);
@@ -112,10 +124,10 @@ static void render_state(const state_message_t *state) {
 
     printf("\033[H\033[J");
     if (state->game_mode == GAME_MODE_TIMED) {
-        printf("tick=%u | time=%us | remaining=%us | WASD move | p pause | q leave\n",
+        printf("tick=%u | time=%us | remaining=%us | WASD move | p pause | q leave | r respawn\n",
                (unsigned)tick, elapsed_s, rem_s);
     } else {
-        printf("tick=%u | time=%us | STANDARD | WASD move | p pause | q leave\n",
+        printf("tick=%u | time=%us | STANDARD | WASD move | p pause | q leave | r respawn\n",
                (unsigned)tick, elapsed_s);
     }
 
@@ -125,12 +137,43 @@ static void render_state(const state_message_t *state) {
     uint8_t width = state->width;
     uint8_t height = state->height;
 
+    int show_border = (state->world_type == 0) ? 1 : 0;
+
+    if (show_border) print_horizontal_border(width);
+
     for (uint8_t y = 0; y < height; y++) {
+        if (show_border) putchar('|');
         for (uint8_t x = 0; x < width; x++) {
-            putchar((char)state->cells[y * width + x]);
+            putchar((char)state->cells[(size_t)y * width + x]);
         }
+        if (show_border) putchar('|');
         putchar('\n');
     }
+
+    if (show_border) print_horizontal_border(width);
+
+    fflush(stdout);
+}
+
+static void render_game_over(const game_over_message_t *msg) {
+    uint32_t elapsed_ms = ntohl(msg->elapsed_ms_net);
+    unsigned elapsed_s = elapsed_ms / 1000U;
+
+    printf("\033[H\033[J");
+    printf("GAME OVER\n");
+    printf("total game time: %us\n\n", elapsed_s);
+
+    printf("results:\n");
+    for (uint8_t i = 0; i < msg->player_count && i < STATE_MAX_PLAYERS; i++) {
+        const game_over_player_entry_t *e = &msg->players[i];
+        if (!e->has_joined) continue;
+        unsigned score = (unsigned)ntohs(e->score_net);
+        uint32_t snake_time_ms = ntohl(e->snake_time_ms_net);
+        unsigned snake_s = snake_time_ms / 1000U;
+        printf("  name=%s score=%u snake_time=%us\n", (const char*)e->name, score, snake_s);
+    }
+
+    printf("\npress ENTER to return to menu\n");
     fflush(stdout);
 }
 
@@ -184,7 +227,7 @@ static void prompt_string(const char *label, const char *default_value, char *ou
     }
 }
 
-static int start_server_process(uint16_t port, game_mode_t mode, uint32_t timed_seconds, int world_type, const char *map_file_path) {
+static int start_server_process(uint16_t port, game_mode_t mode, uint32_t timed_seconds, int world_type, uint8_t map_width, uint8_t map_height, const char *map_file_path) {
     pid_t pid = fork();
     if (pid < 0) return -1;
 
@@ -196,16 +239,20 @@ static int start_server_process(uint16_t port, game_mode_t mode, uint32_t timed_
         char mode_str[16];
         char timed_str[16];
         char world_str[16];
+        char width_str[16];
+        char height_str[16];
 
         snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
         snprintf(mode_str, sizeof(mode_str), "%u", (unsigned)mode);
         snprintf(timed_str, sizeof(timed_str), "%u", (unsigned)timed_seconds);
         snprintf(world_str, sizeof(world_str), "%u", (unsigned)world_type);
+        snprintf(width_str, sizeof(width_str), "%u", (unsigned)map_width);
+        snprintf(height_str, sizeof(height_str), "%u", (unsigned)map_height);
 
         if (world_type == 1 && map_file_path && map_file_path[0] != '\0') {
-            execl("./server_bin", "server_bin", port_str, mode_str, timed_str, world_str, map_file_path, (char*)NULL);
+            execl("./server_bin", "server_bin", port_str, mode_str, timed_str, world_str, width_str, height_str, map_file_path, (char*)NULL);
         } else {
-            execl("./server_bin", "server_bin", port_str, mode_str, timed_str, world_str, (char*)NULL);
+            execl("./server_bin", "server_bin", port_str, mode_str, timed_str, world_str, width_str, height_str, (char*)NULL);
         }
 
         perror("exec server_bin failed");
@@ -238,7 +285,12 @@ typedef struct {
     char player_name[64];
 } paused_session_t;
 
-static int run_game_session(const char *server_ip, uint16_t server_port, const char *player_name, paused_session_t *paused_session) {
+static int run_game_session(const char *server_ip, uint16_t server_port, const char *player_name_raw, paused_session_t *paused_session) {
+    char player_name[64];
+    strncpy(player_name, player_name_raw, sizeof(player_name) - 1);
+    player_name[sizeof(player_name) - 1] = '\0';
+    trim_player_name_inplace(player_name);
+
     int server_socket_fd = connect_to_server(server_ip, server_port);
     if (server_socket_fd < 0) {
         fprintf(stderr, "client: connect failed: %s\n", strerror(errno));
@@ -256,6 +308,9 @@ static int run_game_session(const char *server_ip, uint16_t server_port, const c
 
     int is_running = 1;
     int did_pause = 0;
+    int got_game_over = 0;
+    game_over_message_t game_over;
+    memset(&game_over, 0, sizeof(game_over));
 
     while (is_running) {
         fd_set read_fds;
@@ -282,6 +337,8 @@ static int run_game_session(const char *server_ip, uint16_t server_port, const c
                     (void)send_message(server_socket_fd, MSG_PAUSE, NULL, 0);
                     did_pause = 1;
                     is_running = 0;
+                } else if (ch == 'r' || ch == 'R') {
+                    (void)send_message(server_socket_fd, MSG_RESPAWN, NULL, 0);
                 } else if (ch == 'w' || ch == 'W') {
                     send_input_direction(server_socket_fd, DIR_UP);
                 } else if (ch == 'd' || ch == 'D') {
@@ -295,20 +352,41 @@ static int run_game_session(const char *server_ip, uint16_t server_port, const c
         }
 
         if (FD_ISSET(server_socket_fd, &read_fds)) {
-            state_message_t state;
-            int got_state = recv_state_message(server_socket_fd, &state);
-            if (got_state < 0) {
-                fprintf(stderr, "client: disconnected\n");
+            uint16_t msg_type = 0;
+            uint16_t payload_len = 0;
+
+            uint8_t payload_buf[sizeof(state_message_t) > sizeof(game_over_message_t) ? sizeof(state_message_t) : sizeof(game_over_message_t)];
+
+            if (recv_next_message(server_socket_fd, &msg_type, payload_buf, sizeof(payload_buf), &payload_len) < 0) {
                 break;
             }
-            if (got_state == 1) {
-                render_state(&state);
+
+            if (msg_type == MSG_STATE) {
+                if (payload_len == sizeof(state_message_t)) {
+                    state_message_t state;
+                    memcpy(&state, payload_buf, sizeof(state));
+                    render_state(&state);
+                }
+            } else if (msg_type == MSG_GAME_OVER) {
+                if (payload_len == sizeof(game_over_message_t)) {
+                    memcpy(&game_over, payload_buf, sizeof(game_over));
+                    got_game_over = 1;
+                    is_running = 0;
+                }
             }
         }
     }
 
     restore_terminal(&old_term);
     close(server_socket_fd);
+
+    if (got_game_over) {
+        render_game_over(&game_over);
+        char line[8];
+        read_line(line, sizeof(line));
+        paused_session->has_paused_session = 0;
+        return 0;
+    }
 
     if (did_pause) {
         paused_session->has_paused_session = 1;
@@ -330,11 +408,8 @@ static void print_menu(const paused_session_t *paused) {
     printf("\n=== MENU ===\n");
     printf("1) Nova hra (spusti server)\n");
     printf("2) Pripojit sa na existujuci server\n");
-    if (paused->has_paused_session) {
-        printf("3) Pokracovat v hre (resume)\n");
-    } else {
-        printf("3) Pokracovat v hre (resume) [nie je dostupne]\n");
-    }
+    if (paused->has_paused_session) printf("3) Pokracovat v hre (resume)\n");
+    else printf("3) Pokracovat v hre (resume) [nie je dostupne]\n");
     printf("4) Koniec\n");
     printf("5) Ukoncit server (shutdown)\n");
     printf("Vyber: ");
@@ -357,6 +432,8 @@ int main(void) {
             char server_ip[64];
 
             prompt_string("Meno hraca", "player1", player_name, sizeof(player_name));
+            trim_player_name_inplace(player_name);
+
             prompt_string("IP (pre local server daj 127.0.0.1)", "127.0.0.1", server_ip, sizeof(server_ip));
 
             int port_i = prompt_int("Port", 23456);
@@ -379,6 +456,17 @@ int main(void) {
             int world_i = prompt_int("Svet (0=empty wrap, 1=prekazky zo suboru)", 0);
             int world_type = (world_i == 1) ? 1 : 0;
 
+            int width_i = prompt_int("Sirka mapy (5-80)", 40);
+            int height_i = prompt_int("Vyska mapy (5-40)", 20);
+
+            if (width_i < 5) width_i = 5;
+            if (height_i < 5) height_i = 5;
+            if (width_i > STATE_MAX_WIDTH) width_i = STATE_MAX_WIDTH;
+            if (height_i > STATE_MAX_HEIGHT) height_i = STATE_MAX_HEIGHT;
+
+            uint8_t map_width = (uint8_t)width_i;
+            uint8_t map_height = (uint8_t)height_i;
+
             char map_path[256];
             map_path[0] = '\0';
             const char *map_file_path = NULL;
@@ -388,13 +476,12 @@ int main(void) {
             }
 
             printf("Spustam server na porte %u...\n", (unsigned)port);
-            if (start_server_process(port, mode, timed_seconds, world_type, map_file_path) < 0) {
+            if (start_server_process(port, mode, timed_seconds, world_type, map_width, map_height, map_file_path) < 0) {
                 printf("Nepodarilo sa spustit server (fork/exec).\n");
                 continue;
             }
 
             sleep_ms(200);
-
             (void)run_game_session(server_ip, port, player_name, &paused);
 
         } else if (choice == 2) {
@@ -402,6 +489,8 @@ int main(void) {
             char server_ip[64];
 
             prompt_string("Meno hraca", "player1", player_name, sizeof(player_name));
+            trim_player_name_inplace(player_name);
+
             prompt_string("IP servera", "127.0.0.1", server_ip, sizeof(server_ip));
 
             int port_i = prompt_int("Port", 23456);

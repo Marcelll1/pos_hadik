@@ -1,3 +1,4 @@
+
 #ifndef PROTOCOL_H
 #define PROTOCOL_H
 
@@ -10,17 +11,20 @@ typedef struct {
 } __attribute__((packed)) message_header_t;
 
 enum {
-    MSG_JOIN     = 1,
-    MSG_WELCOME  = 2,
-    MSG_TEXT     = 3,
-    MSG_ERROR    = 4,
+    MSG_JOIN      = 1,
+    MSG_WELCOME   = 2,
+    MSG_TEXT      = 3,
+    MSG_ERROR     = 4,
 
-    MSG_INPUT    = 10,
-    MSG_STATE    = 11,
-    MSG_SHUTDOWN = 12,
+    MSG_INPUT     = 10,
+    MSG_STATE     = 11,
+    MSG_SHUTDOWN  = 12,
 
-    MSG_PAUSE    = 13,
-    MSG_LEAVE    = 14
+    MSG_PAUSE     = 13,
+    MSG_LEAVE     = 14,
+    MSG_RESPAWN   = 15,
+
+    MSG_GAME_OVER = 16
 };
 
 typedef enum {
@@ -34,12 +38,13 @@ typedef struct {
     uint8_t direction;
 } __attribute__((packed)) input_message_t;
 
-#define STATE_MAP_WIDTH  40
-#define STATE_MAP_HEIGHT 20
-#define STATE_MAP_CELLS  (STATE_MAP_WIDTH * STATE_MAP_HEIGHT)
+#define STATE_MAX_WIDTH   80
+#define STATE_MAX_HEIGHT  40
+#define STATE_MAX_CELLS   (STATE_MAX_WIDTH * STATE_MAX_HEIGHT)
 
 #define STATE_MAX_PLAYERS 64
 #define STATE_NAME_MAX    32
+#define PLAYER_NAME_MAX   STATE_NAME_MAX
 
 typedef enum {
     GAME_MODE_STANDARD = 0,
@@ -62,14 +67,30 @@ typedef struct {
     uint8_t width;
     uint8_t height;
     uint8_t game_mode;
-    uint8_t reserved0;
+    uint8_t world_type;
 
     uint32_t elapsed_ms_net;
     uint32_t remaining_ms_net;
 
     state_player_info_t players[STATE_MAX_PLAYERS];
-    uint8_t cells[STATE_MAP_CELLS];
+    uint8_t cells[STATE_MAX_CELLS];
 } __attribute__((packed)) state_message_t;
+
+typedef struct {
+    uint8_t has_joined;
+    uint8_t reserved0;
+    uint16_t score_net;
+    uint32_t snake_time_ms_net;
+    uint8_t name[STATE_NAME_MAX];
+} __attribute__((packed)) game_over_player_entry_t;
+
+typedef struct {
+    uint32_t elapsed_ms_net;
+    uint8_t player_count;
+    uint8_t reserved1;
+    uint16_t reserved2;
+    game_over_player_entry_t players[STATE_MAX_PLAYERS];
+} __attribute__((packed)) game_over_message_t;
 
 int send_all_bytes(int socket_fd, const void *buffer, size_t byte_count);
 int recv_all_bytes(int socket_fd, void *buffer, size_t byte_count);
